@@ -12,9 +12,41 @@ Verifies:
 """
 import pytest
 from playwright.sync_api import sync_playwright
+from app.database.connection import get_db
+from app.database.crud import ACTIVE_CURRICULUM_VERSION
+from app.database.models import LessonCompletion, User
 
 
-def test_youtube_play_button_appearance_and_centering():
+@pytest.fixture
+def completed_demo_lessons():
+    created_ids = []
+    with get_db() as db:
+        user = db.query(User).filter(User.username == "priya").first()
+        for lesson_id in (
+            "py-v2-u1-l01", "py-v2-u1-l02", "py-v2-u1-l03", "py-v2-u1-l04"
+        ):
+            existing = db.query(LessonCompletion).filter(
+                LessonCompletion.learner_id == user.learner.id,
+                LessonCompletion.lesson_id == lesson_id,
+                LessonCompletion.curriculum_version == ACTIVE_CURRICULUM_VERSION,
+            ).first()
+            if not existing:
+                completion = LessonCompletion(
+                    learner_id=user.learner.id,
+                    module_id=1,
+                    lesson_id=lesson_id,
+                    curriculum_version=ACTIVE_CURRICULUM_VERSION,
+                )
+                db.add(completion)
+                db.flush()
+                created_ids.append(completion.id)
+    yield
+    if created_ids:
+        with get_db() as db:
+            db.query(LessonCompletion).filter(LessonCompletion.id.in_(created_ids)).delete(synchronize_session=False)
+
+
+def test_youtube_play_button_appearance_and_centering(completed_demo_lessons):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(viewport={"width": 1440, "height": 900})

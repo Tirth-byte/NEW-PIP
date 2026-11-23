@@ -8,6 +8,7 @@ from app.navigation.nav import (
     go_to_setup,
     go_to_dashboard,
     go_to_curriculum,
+    go_to_rewards,
     open_module,
     open_lesson,
     open_practice,

@@ -26,12 +26,14 @@ from app.screens.s09_project import render_project_screen
 from app.screens.s10_achievements import render_achievements_screen
 from app.screens.s11_report import render_report_screen
 from app.screens.s12_settings import render_settings_screen
+from app.screens.s13_rewards import render_rewards_screen
 
 # 1. Initialize SQLite Database & Ensure Tables and Schema Migrations
 init_db()
 
 # 2. Mount Static Artworks Directory
 app.add_static_files("/artworks", str(ARTWORKS_DIR))
+app.add_static_files("/assets", str(BASE_DIR / "assets"))
 
 # 3. Inject Editorial CSS Style System
 css_path = Path(__file__).parent / "visual" / "styles.css"
@@ -118,9 +120,9 @@ def page_module(module_id: int):
 
 
 @ui.page("/module/{module_id}/lesson/{lesson_id}")
-def page_lesson(module_id: int, lesson_id: str, stage: str = None):
+def page_lesson(module_id: int, lesson_id: str, stage: str = None, resume: int = 0):
     apply_page_head(f"Lesson Workspace — Pip Learn")
-    render_lesson_screen(int(module_id), lesson_id, stage=stage)
+    render_lesson_screen(int(module_id), lesson_id, stage=stage, resume=bool(resume))
 
 
 @ui.page("/practice")
@@ -159,10 +161,19 @@ def page_settings():
     render_settings_screen()
 
 
+@ui.page("/rewards")
+def page_rewards():
+    apply_page_head("Graduate Rewards Preview — Pip Learn")
+    render_rewards_screen()
+
+
 if __name__ in {"__main__", "__mp_main__"}:
     import os
+    import secrets
     port = int(os.environ.get("PORT", 8080))
-    storage_secret = os.environ.get("PIP_STORAGE_SECRET", "pip-learn-marwadi-01ap0303-secret-key-32chars")
+    # A per-process fallback keeps local setup zero-config without shipping a
+    # predictable signing key. Set PIP_STORAGE_SECRET for persistent sessions.
+    storage_secret = os.environ.get("PIP_STORAGE_SECRET") or secrets.token_urlsafe(32)
     ui.run(
         title="Pip Learn 2.0",
         port=port,

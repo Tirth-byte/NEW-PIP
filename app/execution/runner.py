@@ -10,19 +10,33 @@ import tempfile
 import time
 from typing import Dict, Any, Optional
 
-# Forbidden destructive patterns for pre-flight safety check
-DISALLOWED_PATTERNS = [
-    "os.system",
-    "subprocess.Popen",
-    "shutil.rmtree",
-    "pty.spawn",
-    "import socket",
-    "socket.socket",
-    "__import__('os').system",
-    "os.remove",
-    "os.unlink",
-    "rmdir"
-]
+try:
+    import resource
+except ImportError:  # Windows does not expose POSIX resource limits.
+    resource = None
+
+from app.execution.security import validate_code
+
+MAX_OUTPUT_BYTES = 256_000
+
+
+def _apply_resource_limits() -> None:
+    """Apply limits in the child immediately before learner code starts."""
+    if resource is None:
+        return
+    resource.setrlimit(resource.RLIMIT_CPU, (4, 4))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+    if hasattr(resource, "RLIMIT_NPROC"):
+        resource.setrlimit(resource.RLIMIT_NPROC, (16, 16))
+
+
+def _read_capped(path: str) -> str:
+    with open(path, "rb") as stream:
+        data = stream.read(MAX_OUTPUT_BYTES + 1)
+    if len(data) > MAX_OUTPUT_BYTES:
+        data = data[:MAX_OUTPUT_BYTES] + b"\n[output truncated]"
+    return data.decode("utf-8", errors="replace")
 
 def run_python_code(code: str, timeout_sec: float = 3.5, input_data: str = "") -> Dict[str, Any]:
     """
@@ -41,19 +55,18 @@ def run_python_code(code: str, timeout_sec: float = 3.5, input_data: str = "") -
     """
     start_time = time.perf_counter()
 
-    # Pre-flight security check
-    for pattern in DISALLOWED_PATTERNS:
-        if pattern in code:
-            return {
-                "success": False,
-                "stdout": "",
-                "stderr": f"Security restriction: Operation '{pattern}' is not permitted in the learning sandbox.",
-                "exit_code": -1,
-                "elapsed_ms": 0.0,
-                "timeout": False,
-                "security_violation": True,
-                "explanation": "To maintain environment stability and safety, low-level process and destructive filesystem operations are restricted."
-            }
+    violation = validate_code(code)
+    if violation:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": f"Security restriction: {violation}",
+            "exit_code": -1,
+            "elapsed_ms": 0.0,
+            "timeout": False,
+            "security_violation": True,
+            "explanation": "System, process, network, and interpreter-internal operations are restricted."
+        }
 
     with tempfile.TemporaryDirectory() as temp_dir:
         script_file = os.path.join(temp_dir, "learner_script.py")
@@ -67,23 +80,32 @@ def run_python_code(code: str, timeout_sec: float = 3.5, input_data: str = "") -
             "LC_ALL": "en_US.UTF-8",
             "LANG": "en_US.UTF-8",
             "HOME": temp_dir,
-            "PYTHONPATH": os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+            "TMPDIR": temp_dir,
+            "MPLCONFIGDIR": os.path.join(temp_dir, ".matplotlib"),
         }
 
         python_bin = sys.executable
 
         try:
-            process = subprocess.Popen(
-                [python_bin, script_file],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=temp_dir,
-                env=env,
-                text=True
-            )
-
-            stdout, stderr = process.communicate(input=input_data, timeout=timeout_sec)
+            stdout_path = os.path.join(temp_dir, "stdout.txt")
+            stderr_path = os.path.join(temp_dir, "stderr.txt")
+            with open(stdout_path, "wb") as stdout_file, open(stderr_path, "wb") as stderr_file:
+                process_options = {}
+                if os.name == "posix":
+                    process_options["preexec_fn"] = _apply_resource_limits
+                process = subprocess.Popen(
+                    [python_bin, "-I", script_file],
+                    stdin=subprocess.PIPE,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    cwd=temp_dir,
+                    env=env,
+                    text=True,
+                    **process_options,
+                )
+                process.communicate(input=input_data, timeout=timeout_sec)
+            stdout = _read_capped(stdout_path)
+            stderr = _read_capped(stderr_path)
             elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
             exit_code = process.returncode
             success = (exit_code == 0)
@@ -118,7 +140,9 @@ def run_python_code(code: str, timeout_sec: float = 3.5, input_data: str = "") -
 
         except subprocess.TimeoutExpired:
             process.kill()
-            stdout, stderr = process.communicate()
+            process.communicate()
+            stdout = _read_capped(stdout_path)
+            stderr = _read_capped(stderr_path)
             elapsed_ms = round((time.perf_counter() - start_time) * 1000, 2)
             return {
                 "success": False,

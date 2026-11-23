@@ -8,6 +8,9 @@ from app.components.artwork import render_artwork
 from app.curriculum.loader import get_module
 from app.database.connection import get_db
 from app.database.crud import get_learner_summary
+from app.database.crud import ACTIVE_CURRICULUM_VERSION
+from app.database.models import LessonCompletion
+from app.learning.progression import lesson_access
 from app.auth.guards import require_auth
 import app.navigation.nav as nav
 
@@ -29,6 +32,17 @@ def render_module_overview_screen(module_id: int):
 
     mod_prog = summary["module_progress"].get(module.id, {"status": "not_started", "pct": 0.0})
     pct = mod_prog["pct"]
+    with get_db() as db:
+        lesson_access_map = {
+            lesson.id: lesson_access(db, learner.id, module.id, lesson.id)
+            for lesson in module.lessons
+        }
+        completed_lesson_ids = {
+            row[0] for row in db.query(LessonCompletion.lesson_id).filter(
+                LessonCompletion.learner_id == learner.id,
+                LessonCompletion.curriculum_version == ACTIVE_CURRICULUM_VERSION,
+            ).all()
+        }
 
     with page_shell(active_route="/curriculum"):
         with ui.column().classes("w-full max-w-6xl mx-auto px-4 sm:px-6 py-10 gap-8"):
@@ -86,7 +100,11 @@ def render_module_overview_screen(module_id: int):
 
                 with ui.column().classes("w-full gap-3"):
                     for idx, lesson in enumerate(module.lessons, 1):
-                        with ui.card().classes("pip-card-interactive w-full p-4 sm:p-5 flex flex-row items-center justify-between gap-4 cursor-pointer").on("click", lambda l_id=lesson.id: nav.open_lesson(module.id, l_id)):
+                        access = lesson_access_map[lesson.id]
+                        completed = lesson.id in completed_lesson_ids
+                        locked = not access.get("accessible")
+                        card_state = "opacity-65" if locked else ""
+                        with ui.card().classes(f"pip-card-interactive w-full p-4 sm:p-5 flex flex-row items-center justify-between gap-4 cursor-pointer {card_state}").on("click", lambda l_id=lesson.id: nav.open_lesson(module.id, l_id)):
                             with ui.row().classes("items-center gap-4 flex-1"):
                                 ui.label(f"{idx:02d}").classes("font-mono text-base font-bold text-[#8C857D]")
                                 with ui.column().classes("gap-0.5"):
@@ -94,8 +112,15 @@ def render_module_overview_screen(module_id: int):
                                     ui.label(lesson.subtitle).classes("text-xs text-[#5E5A55] line-clamp-1")
 
                             with ui.row().classes("items-center gap-3"):
+                                if completed:
+                                    ui.label("✓ Completed").classes("text-xs text-[#2D6A4F] font-semibold")
+                                elif locked:
+                                    ui.label("🔒 Locked").classes("text-xs text-[#8C857D] font-semibold")
                                 ui.label(f"{lesson.reading_time_min}m read").classes("text-xs text-[#8C857D] font-mono hidden sm:block")
-                                ui.button("Study →", on_click=lambda l_id=lesson.id: nav.open_lesson(module.id, l_id)).classes("btn-subtle text-xs py-1 px-3")
+                                action_label = "Review →" if completed else ("Locked" if locked else "Study →")
+                                action = ui.button(action_label, on_click=lambda l_id=lesson.id: nav.open_lesson(module.id, l_id)).classes("btn-subtle text-xs py-1 px-3")
+                                if locked:
+                                    action.props("disabled")
 
             # Practice, Assessment, and Mini-Project Links
             with ui.row().classes("w-full gap-6 mt-2 flex-wrap md:flex-nowrap"):

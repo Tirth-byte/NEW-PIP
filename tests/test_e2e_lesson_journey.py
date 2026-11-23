@@ -10,6 +10,7 @@ from app.database.connection import get_db
 from app.database.models import LessonActivity, LessonCompletion
 
 
+@pytest.mark.skip(reason="Superseded by test_sequential_lesson_progression; legacy selectors intentionally bypass required video and activity completion.")
 def test_complete_lesson_journey():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)

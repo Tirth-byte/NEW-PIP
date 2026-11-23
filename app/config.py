@@ -2,7 +2,11 @@
 Pip Learn 2.0 - Configuration and Global Settings
 Marwadi University - Programming with Python (Course: 01AP0303)
 """
+import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Paths
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -12,7 +16,7 @@ MASTER_ARTWORKS_DIR = BASE_DIR / "pip-learn-artworks" / "artworks"
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "pip_learn.db"
-DATABASE_URL = f"sqlite:///{DB_PATH}"
+DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{DB_PATH}")
 
 # Course Metadata
 COURSE_CODE = "01AP0303"

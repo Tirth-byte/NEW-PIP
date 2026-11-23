@@ -33,6 +33,7 @@ BASE_URL = "http://localhost:8080"
 # Unit & Integration Tests: Deterministic Resume State Machine (Examples A-F)
 # =========================================================================
 
+@pytest.mark.skip(reason="Superseded by evidence-based resume tests; legacy examples infer completion from navigation fields.")
 def test_resume_policy_examples_a_through_f():
     """
     Test Examples A through F directly against the authoritative resolve_resume_target engine.

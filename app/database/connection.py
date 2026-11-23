@@ -2,7 +2,7 @@
 Database connection and session handling.
 """
 from contextlib import contextmanager
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, Session
 from app.config import DATABASE_URL, DB_PATH
 from app.database.models import Base
@@ -13,6 +13,15 @@ engine = create_engine(
     connect_args={"check_same_thread": False},
     echo=False
 )
+
+
+@event.listens_for(engine, "connect")
+def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record):
+    """SQLite requires foreign-key enforcement to be enabled per connection."""
+    if DATABASE_URL.startswith("sqlite"):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, expire_on_commit=False, bind=engine)
 _schema_ready = False
@@ -50,6 +59,24 @@ def init_db():
                     f"ALTER TABLE {table} ADD COLUMN curriculum_version VARCHAR(20) "
                     "NOT NULL DEFAULT 'legacy-v1';"
                 ))
+        conn.commit()
+
+        # Lesson progression evidence was added after the original activity
+        # model. These additive columns preserve all existing work while
+        # keeping display history distinct from verified completion.
+        activity_columns = [
+            r[1] for r in conn.execute(text("PRAGMA table_info(lesson_activities);"))
+        ]
+        if "reading_completed_json" not in activity_columns:
+            conn.execute(text(
+                "ALTER TABLE lesson_activities ADD COLUMN "
+                "reading_completed_json TEXT NOT NULL DEFAULT '[]';"
+            ))
+        if "experiment_passed" not in activity_columns:
+            conn.execute(text(
+                "ALTER TABLE lesson_activities ADD COLUMN "
+                "experiment_passed BOOLEAN NOT NULL DEFAULT 0;"
+            ))
         conn.commit()
 
         # New module-progress rows start at zero; legacy percentages are kept
@@ -109,6 +136,41 @@ def init_db():
                     {"uid": user_id, "lid": learner_id}
                 )
             conn.commit()
+
+        # The demo learner may have been created after the earlier migration
+        # pass. Idempotently ensure every learner has one row per module for
+        # the active curriculum, including on a completely fresh database.
+        learner_ids = [row[0] for row in conn.execute(text("SELECT id FROM learners")).fetchall()]
+        for learner_id in learner_ids:
+            for module_id in range(1, 9):
+                conn.execute(text(
+                    "INSERT INTO module_progress "
+                    "(learner_id,module_id,curriculum_version,status,completion_percentage,last_accessed) "
+                    "SELECT :lid,:mid,'2026.1','not_started',0.0,:now "
+                    "WHERE NOT EXISTS (SELECT 1 FROM module_progress WHERE learner_id=:lid "
+                    "AND module_id=:mid AND curriculum_version='2026.1')"
+                ), {"lid": learner_id, "mid": module_id, "now": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")})
+        conn.commit()
+
+        # Application checks make these operations idempotent; unique indexes
+        # also protect them against concurrent requests at the database layer.
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_module_progress_identity "
+            "ON module_progress(learner_id,module_id,curriculum_version)"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_lesson_completion_identity "
+            "ON lesson_completions(learner_id,module_id,lesson_id,curriculum_version)"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_lesson_activity_identity "
+            "ON lesson_activities(learner_id,module_id,lesson_id,curriculum_version)"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_achievement_identity "
+            "ON achievements(learner_id,code)"
+        ))
+        conn.commit()
 
     _schema_ready = True
 

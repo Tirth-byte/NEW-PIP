@@ -30,6 +30,7 @@ def render_footer():
                     ui.link("Practice Laboratory", "/practice").classes("text-[#5E5A55] hover:text-[#161616] no-underline")
                     ui.link("Project Workshop", "/projects").classes("text-[#5E5A55] hover:text-[#161616] no-underline")
                     ui.link("Achievements & Mastery", "/achievements").classes("text-[#5E5A55] hover:text-[#161616] no-underline")
+                    ui.link("Graduate Rewards Preview", "/rewards").classes("text-[#5E5A55] hover:text-[#161616] no-underline")
 
                 with ui.column().classes("gap-2 text-xs"):
                     ui.label("SYSTEM & SAFETY").classes("text-[11px] font-semibold text-[#161616] tracking-wider uppercase")

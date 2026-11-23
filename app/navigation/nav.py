@@ -80,6 +80,11 @@ def go_to_curriculum():
     ui.navigate.to("/curriculum")
 
 
+def go_to_rewards():
+    """Navigate to the public graduate rewards preview."""
+    ui.navigate.to("/rewards")
+
+
 def open_module(module_id: int):
     """Navigate to specific module overview (enforces auth)."""
     with get_db() as db:
@@ -90,27 +95,39 @@ def open_module(module_id: int):
     ui.navigate.to(f"/module/{module_id}")
 
 
-import json
-from app.curriculum.challenges import get_lesson_challenges
-from app.curriculum.loader import get_lesson
-from app.curriculum.sections import get_lesson_reading_sections
-
-
-def open_lesson(module_id: int, lesson_id: str, stage: Optional[str] = None):
+def open_lesson(
+    module_id: int,
+    lesson_id: str,
+    stage: Optional[str] = None,
+    *,
+    resume: bool = False,
+):
     """
-    Open canonical lesson workspace with optional validated stage parameter.
-    If stage is explicitly specified, navigates to ?stage={clean_stage}.
-    If stage is None, navigates to canonical lesson route, letting workspace resolve position.
+    Open a lesson through the canonical access gate.
+
+    Ordinary opens always use the clean lesson URL and therefore begin at
+    Read section 1. Only the explicit Continue Learning path sets ``resume``;
+    even then the workspace derives the destination from verified evidence.
     """
     valid_stages = {"read", "watch", "experiment", "practice", "check"}
-    clean_stage = stage if stage in valid_stages else ("read" if stage is not None else None)
     target = f"/module/{module_id}/lesson/{lesson_id}"
-    if clean_stage:
-        target += f"?stage={clean_stage}"
+    if resume:
+        target += "?resume=1"
     with get_db() as db:
         auth = get_current_user_and_learner(db)
         if not auth:
             go_to_login(redirect_path=target)
+            return
+        _, learner = auth
+        from app.learning.progression import lesson_access
+        access = lesson_access(db, learner.id, module_id, lesson_id)
+        if not access.get("accessible"):
+            ui.notify(access.get("reason") or "This lesson is still locked.", color="warning")
+            prerequisite = access.get("prerequisite")
+            if prerequisite:
+                ui.navigate.to(
+                    f"/module/{prerequisite['module_id']}/lesson/{prerequisite['lesson_id']}"
+                )
             return
     ui.navigate.to(target)
 
@@ -215,7 +232,23 @@ def resolve_resume_destination(db: Session, learner_id: int) -> dict:
     ).all()
     completed_ids = {c[0] for c in completions}
 
-    # 3. Check most recent activity in SQLite
+    from app.learning.progression import get_lesson_progress, lesson_access
+
+    def destination(module_id: int, lesson_id: str) -> dict:
+        progress = get_lesson_progress(db, learner_id, module_id, lesson_id)
+        return {
+            "module_id": module_id,
+            "lesson_id": lesson_id,
+            "stage": progress["resume_stage"],
+            "reading_section": progress["resume_reading_section"],
+            "challenge_idx": progress["resume_challenge_idx"],
+            "checkpoint_idx": progress["resume_checkpoint_idx"],
+            "route": f"/module/{module_id}/lesson/{lesson_id}?resume=1",
+            "is_completed": progress["certified"],
+        }
+
+    # 3. Check most recent activity in SQLite. Navigation history chooses the
+    # lesson only; verified evidence chooses the actual resumable position.
     latest_activity = db.query(LessonActivity).filter(
         LessonActivity.learner_id == learner_id,
         LessonActivity.curriculum_version == ACTIVE_CURRICULUM_VERSION,
@@ -223,69 +256,18 @@ def resolve_resume_destination(db: Session, learner_id: int) -> dict:
 
     # If the learner has an active, unfinished lesson
     if latest_activity and latest_activity.lesson_id not in completed_ids:
-        mod = get_module(latest_activity.module_id)
-        les = get_lesson(latest_activity.module_id, latest_activity.lesson_id)
-        if mod and les:
-            stage = latest_activity.stage if latest_activity.stage in STAGES else "read"
-            read_sec = latest_activity.reading_section or 0
-
-            # Sub-stage index for practice
-            raw_practice = json.loads(latest_activity.practice_state_json or "{}")
-            challenges = get_lesson_challenges(les.id, les.practice_tasks or mod.practice_exercises)
-            challenge_idx = 0
-            for i, ch in enumerate(challenges):
-                if not raw_practice.get(ch.id, {}).get("passed", False):
-                    challenge_idx = i
-                    break
-
-            # Sub-stage index for check
-            raw_checkpoint = json.loads(latest_activity.checkpoint_state_json or "{}")
-            checkpoints = getattr(les, "checkpoint_questions", None) or getattr(les, "checkpoints", None) or []
-            checkpoint_idx = 0
-            for i in range(len(checkpoints)):
-                if not raw_checkpoint.get(f"q_{i}", {}).get("passed", False):
-                    checkpoint_idx = i
-                    break
-
-            return {
-                "module_id": latest_activity.module_id,
-                "lesson_id": latest_activity.lesson_id,
-                "stage": stage,
-                "reading_section": read_sec,
-                "challenge_idx": challenge_idx,
-                "checkpoint_idx": checkpoint_idx,
-                "route": f"/module/{latest_activity.module_id}/lesson/{latest_activity.lesson_id}?stage={stage}",
-                "is_completed": False
-            }
+        access = lesson_access(
+            db, learner_id, latest_activity.module_id, latest_activity.lesson_id
+        )
+        if access.get("accessible"):
+            return destination(latest_activity.module_id, latest_activity.lesson_id)
 
     # 4. If latest activity was finished or no activity: advance to first incomplete lesson in syllabus order
     for mod in all_modules:
         for les in mod.lessons:
             if les.id not in completed_ids:
-                # Check if this lesson has an existing saved activity
-                act = db.query(LessonActivity).filter(
-                    LessonActivity.learner_id == learner_id,
-                    LessonActivity.module_id == mod.id,
-                    LessonActivity.lesson_id == les.id,
-                    LessonActivity.curriculum_version == ACTIVE_CURRICULUM_VERSION,
-                ).first()
-                if act and act.stage in STAGES:
-                    stage = act.stage
-                    read_sec = act.reading_section or 0
-                else:
-                    stage = "read"
-                    read_sec = 0
-
-                return {
-                    "module_id": mod.id,
-                    "lesson_id": les.id,
-                    "stage": stage,
-                    "reading_section": read_sec,
-                    "challenge_idx": 0,
-                    "checkpoint_idx": 0,
-                    "route": f"/module/{mod.id}/lesson/{les.id}?stage={stage}",
-                    "is_completed": False
-                }
+                if lesson_access(db, learner_id, mod.id, les.id).get("accessible"):
+                    return destination(mod.id, les.id)
 
     # 5. Default fallback: Module 1, Lesson 1, Read
     first_mod = all_modules[0]
@@ -297,7 +279,7 @@ def resolve_resume_destination(db: Session, learner_id: int) -> dict:
         "reading_section": 0,
         "challenge_idx": 0,
         "checkpoint_idx": 0,
-        "route": f"/module/{first_mod.id}/lesson/{first_les.id}?stage=read",
+        "route": f"/module/{first_mod.id}/lesson/{first_les.id}?resume=1",
         "is_completed": False
     }
 
@@ -331,7 +313,7 @@ def resume_learning(learner_id: Optional[int] = None):
         if m_id == -1:
             ui.navigate.to("/report")
             return
-        open_lesson(m_id, l_id, stage)
+        open_lesson(m_id, l_id, stage, resume=True)
 
 
 def start_learning():

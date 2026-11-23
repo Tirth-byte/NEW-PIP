@@ -10,8 +10,6 @@ Authoritative Pip Learn implementation adhering to:
 - Complete state persistence to SQLite database
 """
 import json
-from html import escape
-from typing import List, Tuple
 
 from nicegui import ui
 
@@ -25,13 +23,22 @@ from app.database.connection import get_db
 from app.database.crud import (
     get_lesson_activity,
     mark_lesson_complete,
-    record_practice_attempt,
     update_lesson_activity,
+)
+from app.learning.progression import (
+    ProgressionError,
+    complete_reading_section,
+    complete_video,
+    get_lesson_progress,
+    lesson_access,
+    mark_video_started,
+    run_experiment,
+    require_stage,
+    submit_checkpoint_answer,
+    submit_practice_solution,
 )
 from app.auth.guards import require_auth
 import app.navigation.nav as nav
-from app.execution.evaluator import evaluate_exercise
-from app.execution.runner import run_python_code
 
 
 STAGES = ["read", "watch", "experiment", "practice", "check"]
@@ -42,7 +49,9 @@ from app.curriculum.sections import get_lesson_reading_sections
 _reading_sections = get_lesson_reading_sections
 
 
-def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
+def render_lesson_screen(
+    module_id: int, lesson_id: str, stage: str = None, resume: bool = False
+):
     with get_db() as db:
         auth = require_auth(db, active_route=f"/module/{module_id}/lesson/{lesson_id}")
         if not auth:
@@ -61,6 +70,25 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                 ui.button("← Return to Curriculum", on_click=nav.go_to_curriculum).classes("btn-blue mx-auto")
             return
 
+        with get_db() as db:
+            access = lesson_access(db, learner_id, module.id, lesson.id)
+        if not access.get("accessible"):
+            prerequisite = access.get("prerequisite")
+            with ui.column().classes("w-full max-w-xl mx-auto py-16 text-center items-center gap-4"):
+                ui.icon("lock", size="3rem", color="#8C857D")
+                ui.label("Lesson Locked").classes("font-serif text-3xl")
+                ui.label(access.get("reason") or "Complete the prerequisite lesson first.").classes(
+                    "text-sm text-[#5E5A55]"
+                )
+                if prerequisite:
+                    ui.button(
+                        f"Open prerequisite: {prerequisite['title']}",
+                        on_click=lambda: nav.open_lesson(
+                            prerequisite["module_id"], prerequisite["lesson_id"]
+                        ),
+                    ).classes("btn-blue")
+            return
+
         lesson_ids = [item.id for item in module.lessons]
         lesson_index = lesson_ids.index(lesson.id)
         previous_id = lesson_ids[lesson_index - 1] if lesson_index > 0 else None
@@ -74,41 +102,29 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
 
         # Fetch persisted activity and completion from SQLite
         with get_db() as db:
-            from app.database.models import LessonCompletion
-            is_completed = db.query(LessonCompletion).filter(
-                LessonCompletion.learner_id == learner_id,
-                LessonCompletion.module_id == module.id,
-                LessonCompletion.lesson_id == lesson.id,
-            ).first() is not None
-
             activity = get_lesson_activity(db, learner_id, module.id, lesson.id)
             activity_id = activity.id
 
-            raw_practice = json.loads(activity.practice_state_json or "{}")
-            raw_checkpoint = json.loads(activity.checkpoint_state_json or "{}")
+            progress = get_lesson_progress(db, learner_id, module.id, lesson.id)
 
-            # Deterministic stage resolution:
-            # 1. Explicit stage parameter requested in URL always takes precedence
-            if stage in STAGES:
+            # Normal entry and refresh are deterministic: Read, section 1.
+            # Explicit Continue Learning resumes the first incomplete activity;
+            # arbitrary URL stage values never override prerequisite checks.
+            init_stage = progress["resume_stage"] if resume else "read"
+            if resume and stage in STAGES and progress["unlocked"].get(stage, False):
                 init_stage = stage
-            elif is_completed:
-                # Revisiting a completed lesson starts at Read for review
-                init_stage = "read"
-            elif activity.stage in STAGES:
-                # In-progress lesson: resume at the learner's actual saved stage
-                init_stage = activity.stage
-            else:
-                init_stage = "read"
 
             saved_state = {
                 "stage": init_stage,
-                "reading_section": 0 if (is_completed and stage is None) else (activity.reading_section or 0),
+                "reading_section": progress["resume_reading_section"] if resume else 0,
+                "reading_completed": set(progress["reading_completed"]),
                 "video_status": activity.video_status or "not_started",
                 "notes": activity.notes or "",
                 "experiment_code": activity.experiment_code or lesson.executable_code,
                 "experiment_attempted": activity.experiment_attempted or False,
-                "practice": raw_practice,
-                "checkpoint": raw_checkpoint,
+                "experiment_passed": activity.experiment_passed or False,
+                "practice": dict(progress["practice"]),
+                "checkpoint": dict(progress["checkpoint"]),
             }
 
         def persist_activity(**kwargs):
@@ -140,6 +156,13 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
             first_unpassed_ckpt_idx = max(0, len(checkpoints) - 1)
         active_checkpoint_idx = {"value": first_unpassed_ckpt_idx}
 
+        def current_progress():
+            with get_db() as db:
+                return get_lesson_progress(db, learner_id, module.id, lesson.id)
+
+        def explain_locked(message: str):
+            ui.notify(message, color="warning", position="top")
+
         # Main Workspace Container
         with ui.column().classes("lesson-shell"):
 
@@ -167,16 +190,36 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
 
             with ui.tabs(value=saved_state["stage"]).props("dense no-caps align=justify").classes("lesson-tabs w-full") as tabs:
                 for num, key, label in stage_tabs_list:
-                    stage_tab_elements[key] = ui.tab(key, label=f"{num} · {label}")
+                    marker = "✓" if progress["complete"][key] else ("🔒" if not progress["unlocked"][key] else "")
+                    stage_tab_elements[key] = ui.tab(
+                        key, label=f"{num} · {label}{' · ' + marker if marker else ''}"
+                    ).classes("stage-locked" if not progress["unlocked"][key] else "")
+
+            def refresh_stage_tabs():
+                snapshot = current_progress()
+                for num, key, label in stage_tabs_list:
+                    marker = "✓" if snapshot["complete"][key] else ("🔒" if not snapshot["unlocked"][key] else "")
+                    stage_tab_elements[key].set_label(
+                        f"{num} · {label}{' · ' + marker if marker else ''}"
+                    )
+                    if snapshot["unlocked"][key]:
+                        stage_tab_elements[key].classes(remove="stage-locked")
+                    else:
+                        stage_tab_elements[key].classes(add="stage-locked")
 
             def advance_to_stage(target_stage: str):
                 if target_stage not in STAGES or saved_state.get("stage") == target_stage:
                     return
+                snapshot = current_progress()
+                try:
+                    require_stage(snapshot, target_stage)
+                except ProgressionError as exc:
+                    explain_locked(str(exc))
+                    tabs.set_value(saved_state["stage"])
+                    return
                 saved_state["stage"] = target_stage
                 tabs.set_value(target_stage)
                 persist_activity(stage=target_stage)
-                # Keep browser URL synchronized with current stage for refresh & history
-                ui.run_javascript(f"try {{ window.history.replaceState(null, '', '/module/{module.id}/lesson/{lesson.id}?stage={target_stage}'); }} catch(e) {{}}")
                 if target_stage != "watch":
                     ui.run_javascript(
                         "document.querySelectorAll('iframe.youtube-frame').forEach(function(f) {"
@@ -187,9 +230,15 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
 
             def on_stage_change(event):
                 if event.value in STAGES and saved_state.get("stage") != event.value:
+                    snapshot = current_progress()
+                    try:
+                        require_stage(snapshot, event.value)
+                    except ProgressionError as exc:
+                        explain_locked(str(exc))
+                        tabs.set_value(saved_state["stage"])
+                        return
                     saved_state["stage"] = event.value
                     persist_activity(stage=event.value)
-                    ui.run_javascript(f"try {{ window.history.replaceState(null, '', '/module/{module.id}/lesson/{lesson.id}?stage={event.value}'); }} catch(e) {{}}")
                     if event.value != "watch":
                         ui.run_javascript(
                             "document.querySelectorAll('iframe.youtube-frame').forEach(function(f) {"
@@ -227,11 +276,14 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                             with ui.row().classes("w-full items-center gap-2 flex-wrap"):
                                 for s_idx, (s_title, _, _) in enumerate(sections):
                                     is_cur = s_idx == pos
+                                    is_done = s_idx in saved_state["reading_completed"]
+                                    is_unlocked = s_idx == 0 or (s_idx - 1) in saved_state["reading_completed"]
+                                    marker = " ✓" if is_done else (" 🔒" if not is_unlocked else "")
                                     pill = ui.button(
-                                        f"{s_idx + 1}. {s_title}",
+                                        f"{s_idx + 1}. {s_title}{marker}",
                                         on_click=lambda idx=s_idx: jump_to_section(idx)
                                     ).props("flat dense").classes(
-                                        f"reading-pill {'active' if is_cur else ''}"
+                                        f"reading-pill {'active' if is_cur else ''} {'passed' if is_done else ''} {'locked' if not is_unlocked else ''}"
                                     )
 
                             # Section Content Card
@@ -245,11 +297,16 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                 else:
                                     ui.element("div")
 
+                                section_done = pos in saved_state["reading_completed"]
                                 if pos < len(sections) - 1:
-                                    ui.button("Next Section →", on_click=lambda: step_section(1)).classes("btn-blue")
+                                    label = "Next Section →" if section_done else "Complete Section & Continue →"
+                                    ui.button(label, on_click=lambda: complete_or_continue_section()).classes("btn-blue")
                                 else:
                                     next_label = "Continue to Watch Stage →" if video_info else "Continue to Experiment Stage →"
-                                    ui.button(next_label, on_click=lambda: advance_to_stage("watch" if video_info else "experiment")).classes("btn-blue")
+                                    if section_done:
+                                        ui.button(next_label, on_click=lambda: advance_to_stage("watch" if video_info else "experiment")).classes("btn-blue")
+                                    else:
+                                        ui.button("Complete Reading Stage →", on_click=lambda: complete_or_continue_section()).classes("btn-blue")
 
                     def step_section(delta: int):
                         new_pos = current_read_idx["value"] + delta
@@ -258,11 +315,35 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                             persist_activity(reading_section=new_pos, stage="read")
                             render_reading_view.refresh()
 
+                    def complete_or_continue_section():
+                        pos = current_read_idx["value"]
+                        if pos not in saved_state["reading_completed"]:
+                            try:
+                                with get_db() as db:
+                                    snapshot = complete_reading_section(
+                                        db, learner_id, module.id, lesson.id, pos
+                                    )
+                            except ProgressionError as exc:
+                                explain_locked(str(exc))
+                                return
+                            saved_state["reading_completed"] = set(snapshot["reading_completed"])
+                        if pos < len(sections) - 1:
+                            current_read_idx["value"] = pos + 1
+                            persist_activity(reading_section=pos + 1, stage="read")
+                            render_reading_view.refresh()
+                        else:
+                            refresh_stage_tabs()
+                            advance_to_stage("watch" if video_info else "experiment")
+                        render_lesson_navigation.refresh()
+
                     def jump_to_section(idx: int):
-                        if 0 <= idx < len(sections):
+                        unlocked = idx == 0 or (idx - 1) in saved_state["reading_completed"]
+                        if 0 <= idx < len(sections) and unlocked:
                             current_read_idx["value"] = idx
                             persist_activity(reading_section=idx, stage="read")
                             render_reading_view.refresh()
+                        elif 0 <= idx < len(sections):
+                            explain_locked("Complete the previous reading section first.")
 
                     render_reading_view()
 
@@ -277,12 +358,16 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                 ui.label("VIDEO TUTORIAL EMBED").classes("editorial-eyebrow")
 
                                 status_label = None
+                                video_complete_btn = None
 
                                 def handle_playback_start():
                                     saved_state["video_status"] = "started"
-                                    persist_activity(video_status="started")
+                                    with get_db() as db:
+                                        mark_video_started(db, learner_id, module.id, lesson.id)
                                     if status_label:
                                         status_label.set_text("Status: Video active in embedded YouTube player")
+                                    if video_complete_btn:
+                                        video_complete_btn.enable()
 
                                 render_video_player(
                                     video_info=video_info,
@@ -303,6 +388,33 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                                 f"https://www.youtube.com/watch?v={video_info.video_id}",
                                                 new_tab=True,
                                             ).classes("text-[#396DAB] hover:underline font-medium")
+
+                                def finish_video_activity():
+                                    try:
+                                        with get_db() as db:
+                                            snapshot = complete_video(
+                                                db, learner_id, module.id, lesson.id
+                                            )
+                                    except ProgressionError as exc:
+                                        explain_locked(str(exc))
+                                        return
+                                    saved_state["video_status"] = "completed"
+                                    status_label.set_text("✓ Video activity completed")
+                                    video_complete_btn.disable()
+                                    video_complete_btn.set_text("✓ Video Completed")
+                                    refresh_stage_tabs()
+                                    render_lesson_navigation.refresh()
+
+                                if video_info:
+                                    video_complete_btn = ui.button(
+                                        "✓ I Finished the Video",
+                                        on_click=finish_video_activity,
+                                    ).classes("btn-blue text-xs")
+                                    if saved_state["video_status"] == "completed":
+                                        video_complete_btn.set_text("✓ Video Completed")
+                                        video_complete_btn.disable()
+                                    elif saved_state["video_status"] != "started":
+                                        video_complete_btn.disable()
 
                         # Video Study Notes Column
                         with ui.column().classes("workspace-pane-right"):
@@ -394,9 +506,26 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                 exp_diagnostic = ui.label("").classes("text-xs text-[#9D3A3A] hidden")
 
                                 def execute_experiment():
+                                    if not (prediction_box.value or "").strip():
+                                        ui.notify("Write your output prediction before running the experiment.", color="warning")
+                                        return
                                     run_exp_btn.disable()
                                     run_exp_btn.set_text("Running…")
-                                    res = run_python_code(exp_editor.value)
+                                    try:
+                                        with get_db() as db:
+                                            experiment_result = run_experiment(
+                                                db,
+                                                learner_id,
+                                                module.id,
+                                                lesson.id,
+                                                exp_editor.value,
+                                            )
+                                    except ProgressionError as exc:
+                                        run_exp_btn.enable()
+                                        run_exp_btn.set_text("Run Code ▶")
+                                        explain_locked(str(exc))
+                                        return
+                                    res = experiment_result["execution"]
                                     if res["success"]:
                                         exp_output.set_text(res["stdout"].strip() if res["stdout"].strip() else "(Execution completed with no output to stdout)")
                                         exp_output.classes(replace="code-output w-full whitespace-pre-wrap is-success")
@@ -408,8 +537,13 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                             exp_diagnostic.set_text(f"Diagnostic Insight: {res['explanation']}")
                                             exp_diagnostic.set_visibility(True)
 
+                                    snapshot = experiment_result["progress"]
                                     saved_state["experiment_attempted"] = True
-                                    persist_activity(experiment_code=exp_editor.value, experiment_attempted=True)
+                                    saved_state["experiment_passed"] = snapshot["complete"]["experiment"]
+                                    if res["success"]:
+                                        ui.notify("Experiment completed successfully. Practice is now unlocked.", color="positive")
+                                        refresh_stage_tabs()
+                                        render_lesson_navigation.refresh()
                                     run_exp_btn.enable()
                                     run_exp_btn.set_text("Run Code ▶")
 
@@ -434,12 +568,15 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                         is_active = c_idx == active_challenge_idx["value"]
                                         ch_state = saved_state["practice"].get(ch.id, {})
                                         has_passed = ch_state.get("passed", False)
-                                        check_badge = " ✓" if has_passed else ""
+                                        is_unlocked = c_idx == 0 or saved_state["practice"].get(
+                                            challenges[c_idx - 1].id, {}
+                                        ).get("passed", False)
+                                        check_badge = " ✓" if has_passed else (" 🔒" if not is_unlocked else "")
                                         ui.button(
                                             f"Challenge {c_idx + 1}: {ch.difficulty}{check_badge}",
                                             on_click=lambda i=c_idx: switch_challenge(i)
                                         ).props("dense flat").classes(
-                                            f"challenge-tab-btn {'active' if is_active else ''} {'passed' if has_passed else ''}"
+                                            f"challenge-tab-btn {'active' if is_active else ''} {'passed' if has_passed else ''} {'locked' if not is_unlocked else ''}"
                                         )
 
                             challenge_selector()
@@ -498,28 +635,22 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                         def execute_practice_tests():
                                             test_prac_btn.disable()
                                             test_prac_btn.set_text("Evaluating…")
-                                            eval_res = evaluate_exercise(
-                                                prac_editor.value,
-                                                current_ex.test_cases,
-                                                current_ex.expected_substrings,
-                                            )
-                                            # Update persisted state
-                                            saved_state["practice"][current_ex.id] = {
-                                                "code": prac_editor.value,
-                                                "passed": eval_res["passed"],
-                                            }
-                                            persist_activity(practice_state_json=json.dumps(saved_state["practice"]))
-
-                                            with get_db() as db:
-                                                record_practice_attempt(
-                                                    db,
-                                                    learner_id,
-                                                    module.id,
-                                                    current_ex.id,
-                                                    eval_res["passed"],
-                                                    prac_editor.value,
-                                                    eval_res["message"],
-                                                )
+                                            try:
+                                                with get_db() as db:
+                                                    eval_res = submit_practice_solution(
+                                                        db,
+                                                        learner_id,
+                                                        module.id,
+                                                        lesson.id,
+                                                        active_idx,
+                                                        prac_editor.value,
+                                                    )
+                                            except ProgressionError as exc:
+                                                test_prac_btn.enable()
+                                                test_prac_btn.set_text("Run Tests ▶")
+                                                explain_locked(str(exc))
+                                                return
+                                            saved_state["practice"] = dict(eval_res["progress"]["practice"])
 
                                             results_container.clear()
                                             with results_container:
@@ -547,12 +678,21 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                             test_prac_btn.set_text("Run Tests ▶")
                                             # Refresh challenge selector to display the checkmark
                                             challenge_selector.refresh()
+                                            if eval_res["passed"]:
+                                                refresh_stage_tabs()
+                                                render_lesson_navigation.refresh()
 
                                         test_prac_btn.on_click(execute_practice_tests)
 
                     def switch_challenge(idx: int):
-                        active_challenge_idx["value"] = idx
-                        render_practice_view.refresh()
+                        unlocked = idx == 0 or saved_state["practice"].get(
+                            challenges[idx - 1].id, {}
+                        ).get("passed", False)
+                        if unlocked:
+                            active_challenge_idx["value"] = idx
+                            render_practice_view.refresh()
+                        else:
+                            explain_locked("Pass the previous challenge before opening this one.")
 
                     render_practice_view()
 
@@ -574,7 +714,8 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                             saved_state["practice"].get(challenge.id, {}).get("passed", False)
                             for challenge in challenges
                         )
-                        all_passed = questions_passed and saved_state["experiment_attempted"] and practice_passed
+                        snapshot = current_progress()
+                        all_passed = snapshot["certified"]
 
                         with ui.column().classes("check-card"):
                             if all_passed:
@@ -595,7 +736,7 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
 
                                         ui.button(
                                             "Return to Module Overview",
-                                            on_click=lambda: nav.open_module_overview(module.id)
+                                            on_click=lambda: nav.open_module(module.id)
                                         ).props("outline").classes("btn-subtle")
                                 return
 
@@ -636,16 +777,23 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                     ui.notify("Please select an answer first.", color="warning")
                                     return
                                 selected_index = curr_q.options.index(radio_group.value)
-                                is_correct = (selected_index == curr_q.correct_index)
-                                attempts = checkpoint_answers.get(q_key, {}).get("attempts", 0) + 1
-
-                                checkpoint_answers[q_key] = {
-                                    "choice_index": selected_index,
-                                    "choice_text": radio_group.value,
-                                    "passed": is_correct,
-                                    "attempts": attempts,
-                                }
-                                persist_activity(checkpoint_state_json=json.dumps(checkpoint_answers))
+                                try:
+                                    with get_db() as db:
+                                        answer_result = submit_checkpoint_answer(
+                                            db,
+                                            learner_id,
+                                            module.id,
+                                            lesson.id,
+                                            q_idx,
+                                            selected_index,
+                                        )
+                                except ProgressionError as exc:
+                                    explain_locked(str(exc))
+                                    return
+                                is_correct = answer_result["passed"]
+                                attempts = answer_result["attempts"]
+                                checkpoint_answers.clear()
+                                checkpoint_answers.update(answer_result["progress"]["checkpoint"])
 
                                 feedback_box.clear()
                                 feedback_box.classes(remove="hidden")
@@ -657,6 +805,8 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                             ui.label(curr_q.explanation).classes("text-xs text-[#2D6A4F] leading-relaxed")
                                         check_action_btn.classes(add="hidden")
                                         continue_action_btn.classes(remove="hidden")
+                                        refresh_stage_tabs()
+                                        render_lesson_navigation.refresh()
                                     else:
                                         with ui.column().classes("check-feedback-banner is-incorrect w-full"):
                                             ui.label("Not quite yet — Try again").classes("font-semibold text-sm text-[#9D3A3A]")
@@ -667,22 +817,16 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                 if q_idx < total_q - 1:
                                     switch_question(q_idx + 1)
                                 else:
-                                    # Certification requires evidence from every active stage,
-                                    # not merely clicking through the checkpoint.
-                                    practice_passed = all(
-                                        saved_state["practice"].get(challenge.id, {}).get("passed", False)
-                                        for challenge in challenges
-                                    )
-                                    if not saved_state["experiment_attempted"] or not practice_passed:
-                                        missing = []
-                                        if not saved_state["experiment_attempted"]:
-                                            missing.append("run the Experiment")
-                                        if not practice_passed:
-                                            missing.append("pass all Practice activities")
-                                        ui.notify("Before certification, " + " and ".join(missing) + ".", color="warning")
-                                        return
                                     with get_db() as db:
-                                        mark_lesson_complete(db, learner_id, module.id, lesson.id, len(module.lessons))
+                                        certified = mark_lesson_complete(
+                                            db, learner_id, module.id, lesson.id, len(module.lessons)
+                                        )
+                                    if not certified:
+                                        ui.notify(
+                                            "Complete every required activity before certification.",
+                                            color="warning",
+                                        )
+                                        return
                                     render_check_view.refresh()
                                     render_lesson_navigation.refresh()
 
@@ -701,21 +845,25 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                 continue_action_btn.classes(remove="hidden")
 
                     def switch_question(idx: int):
-                        active_checkpoint_idx["value"] = idx
-                        render_check_view.refresh()
+                        unlocked = idx == 0 or checkpoint_answers.get(
+                            f"q_{idx - 1}", {}
+                        ).get("passed", False)
+                        if 0 <= idx < len(checkpoints) and unlocked:
+                            active_checkpoint_idx["value"] = idx
+                            render_check_view.refresh()
+                        elif 0 <= idx < len(checkpoints):
+                            explain_locked("Answer the previous checkpoint correctly first.")
 
                     def restart_checkpoint():
-                        checkpoint_answers.clear()
-                        persist_activity(checkpoint_state_json=json.dumps({}))
                         active_checkpoint_idx["value"] = 0
                         render_check_view.refresh()
-                        render_lesson_navigation.refresh()
 
                     render_check_view()
 
             # 4. Bottom Shared Lesson Navigation Footer (Left: Back, Center: Progress, Right: Next)
             @ui.refreshable
             def render_lesson_navigation():
+                snapshot = current_progress()
                 cur_stage = saved_state.get("stage") if saved_state.get("stage") in STAGES else (tabs.value if tabs.value in STAGES else "read")
                 if cur_stage not in STAGES:
                     cur_stage = "read"
@@ -771,22 +919,19 @@ def render_lesson_screen(module_id: int, lesson_id: str, stage: str = None):
                                 persist_activity(experiment_code=saved_state["experiment_code"])
                             advance_to_stage(target)
 
-                        ui.button(
+                        next_button = ui.button(
                             f"Next Stage: {stage_titles[next_stage]} →",
                             on_click=lambda _, t=next_stage: handle_next(t),
                         ).classes("btn-blue text-xs font-semibold px-4 py-2")
+                        if not snapshot["unlocked"][next_stage]:
+                            next_button.props("disabled").classes(
+                                add="opacity-50 cursor-not-allowed"
+                            ).tooltip(
+                                f"Complete the required {stage_titles[cur_stage]} activity first."
+                            )
                     else:
                         # Final stage: Check
-                        questions_passed = (
-                            len(checkpoints) > 0
-                            and all(checkpoint_answers.get(f"q_{i}", {}).get("passed", False) for i in range(len(checkpoints)))
-                        )
-                        practice_passed = all(
-                            saved_state["practice"].get(challenge.id, {}).get("passed", False)
-                            for challenge in challenges
-                        )
-                        all_passed = questions_passed and saved_state["experiment_attempted"] and practice_passed
-                        if all_passed:
+                        if snapshot["certified"]:
                             if next_id:
                                 ui.button(
                                     "Next Lesson →",

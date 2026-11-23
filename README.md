@@ -106,15 +106,15 @@ Pip Learn is not merely an educational tool for learning Python; **it is an adva
 ### Python-Native UI Architecture
 Pip Learn uses **NiceGUI** (`nicegui>=3.18.0`) on top of **FastAPI** and **Starlette**. The DOM structure, reactive component trees, responsive layouts, and WebSocket client-server bindings are written entirely in Python:
 * **Route Declaration (`app/main.py`):** Page routes are defined via decorators (`@ui.page("/")`, `@ui.page("/dashboard")`, `@ui.page("/module/{module_id}/lesson/{lesson_id}")`).
-* **Modular Screen Renderers (`app/screens/`):** 12 individual screen modules manage distinct platform domains—from authentication (`s00_auth.py`) to the lesson workspace (`s06_lesson.py`) and academic reports (`s11_report.py`).
+* **Modular Screen Renderers (`app/screens/`):** 13 individual screen modules manage distinct platform domains—from authentication (`s00_auth.py`) to the lesson workspace (`s06_lesson.py`), academic reports (`s11_report.py`), and rewards (`s13_rewards.py`).
 * **Zero JavaScript Build Step:** Developers write standard Python; no node modules, bundlers, or Webpack configurations are required.
 
 ### Isolated Subprocess Code Execution
 To allow users to write and execute arbitrary Python code safely, the platform incorporates a sandboxed execution engine (`app/execution/runner.py`):
-* **AST Pre-Flight Safety Verification:** Before running learner scripts, an AST-based analyzer (`app/execution/security.py`) checks for unauthorized system calls (such as `os.system`, `subprocess.Popen`, `shutil.rmtree`, or raw network sockets).
+* **AST Pre-Flight Safety Verification:** Before running learner scripts, an AST-based analyzer (`app/execution/security.py`) rejects process, network, interpreter-internal, and other unsafe operations.
 * **Process Isolation:** User code runs inside isolated temporary directories (`tempfile.TemporaryDirectory`) via `subprocess.Popen`.
-* **Execution Guardrails:** Strict wall-clock timeouts (default: 3.5 seconds) terminate infinite loops and prevent memory exhaustion.
-* **Output Capture:** Standard output, standard error, exit codes, and millisecond elapsed execution times are parsed and relayed to the frontend.
+* **Execution Guardrails:** Wall-clock and CPU timeouts, file/output limits, descriptor limits, a dedicated temporary directory, and isolated interpreter mode constrain each run.
+* **Output Capture:** Bounded standard output and error, exit codes, and millisecond elapsed execution times are parsed and relayed to the frontend.
 
 ### Automated Challenge Evaluation
 Practice solutions are graded programmatically in `app/execution/evaluator.py`:
@@ -243,12 +243,16 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 4. Environment Configuration (Optional)
+### 4. Environment Configuration (Recommended)
 A pre-configured template is included:
 ```bash
 cp .env.example .env
 ```
-Default parameters allow the application to function immediately without manual adjustments.
+Generate a private storage secret and place it in `.env`:
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+Paste the generated value after `PIP_STORAGE_SECRET=`. If omitted, the app creates an ephemeral key at startup; local use still works, but browser sessions will not survive an application restart.
 
 ### 5. Launch the Platform
 ```bash
@@ -293,7 +297,7 @@ pytest
 * `tests/test_phase12_acceptance.py` & `test_play_button_spec.py` — Playwright browser automation tests.
 * `tests/test_projects.py` — Capstone project execution verification.
 
-**Status:** `48 passed (100% pass rate)`
+**Latest verified status:** `48 passed, 5 skipped` (the skipped cases are superseded legacy browser/navigation scenarios retained for historical coverage).
 
 <br>
 

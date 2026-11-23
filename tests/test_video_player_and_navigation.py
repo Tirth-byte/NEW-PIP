@@ -10,11 +10,41 @@ Verifies:
 """
 import pytest
 from playwright.sync_api import sync_playwright
+from app.database.connection import get_db
+from app.database.crud import ACTIVE_CURRICULUM_VERSION
+from app.database.models import LessonCompletion, User
 
 BASE_URL = "http://localhost:8080"
 
 
-def test_video_player_layout_stability_and_navigation():
+@pytest.fixture
+def completed_demo_lessons():
+    created_ids = []
+    with get_db() as db:
+        user = db.query(User).filter(User.username == "priya").first()
+        for lesson_id in ("py-v2-u1-l01", "py-v2-u1-l02"):
+            existing = db.query(LessonCompletion).filter(
+                LessonCompletion.learner_id == user.learner.id,
+                LessonCompletion.lesson_id == lesson_id,
+                LessonCompletion.curriculum_version == ACTIVE_CURRICULUM_VERSION,
+            ).first()
+            if not existing:
+                completion = LessonCompletion(
+                    learner_id=user.learner.id,
+                    module_id=1,
+                    lesson_id=lesson_id,
+                    curriculum_version=ACTIVE_CURRICULUM_VERSION,
+                )
+                db.add(completion)
+                db.flush()
+                created_ids.append(completion.id)
+    yield
+    if created_ids:
+        with get_db() as db:
+            db.query(LessonCompletion).filter(LessonCompletion.id.in_(created_ids)).delete(synchronize_session=False)
+
+
+def test_video_player_layout_stability_and_navigation(completed_demo_lessons):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(viewport={"width": 1280, "height": 900})
@@ -28,13 +58,15 @@ def test_video_player_layout_stability_and_navigation():
         page.wait_for_timeout(1000)
 
         # Step 2: Open first lesson with a verified video (Install and Setup)
-        page.goto(f"{BASE_URL}/module/1/lesson/py-v2-u1-l02", wait_until="networkidle")
+        page.goto(
+            f"{BASE_URL}/module/1/lesson/py-v2-u1-l02?resume=1&stage=watch",
+            wait_until="networkidle",
+        )
         page.wait_for_timeout(1000)
         assert "Lesson Workspace" in page.title()
 
-        # Step 3: Switch to Watch stage
-        page.locator("div.q-tab:has-text('Watch')").click()
-        page.wait_for_timeout(800)
+        # Step 3: Explicit review of the completed Watch stage
+        assert page.locator("div.q-tab--active:has-text('Watch')").is_visible()
 
         # -------------------------------------------------------------
         # 1. FIXED 16:9 CONTAINER & ZERO LAYOUT SHIFT VERIFICATION

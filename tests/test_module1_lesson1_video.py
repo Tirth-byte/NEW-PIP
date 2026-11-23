@@ -13,8 +13,37 @@ import pytest
 from playwright.sync_api import sync_playwright
 
 from app.curriculum.videos import get_lesson_video
+from app.database.connection import get_db
+from app.database.crud import ACTIVE_CURRICULUM_VERSION
+from app.database.models import LessonCompletion, User
 
 BASE_URL = "http://localhost:8080"
+
+
+@pytest.fixture
+def completed_demo_lesson():
+    created_ids = []
+    with get_db() as db:
+        user = db.query(User).filter(User.username == "priya").first()
+        existing = db.query(LessonCompletion).filter(
+            LessonCompletion.learner_id == user.learner.id,
+            LessonCompletion.lesson_id == "py-v2-u1-l01",
+            LessonCompletion.curriculum_version == ACTIVE_CURRICULUM_VERSION,
+        ).first()
+        if not existing:
+            completion = LessonCompletion(
+                learner_id=user.learner.id,
+                module_id=1,
+                lesson_id="py-v2-u1-l01",
+                curriculum_version=ACTIVE_CURRICULUM_VERSION,
+            )
+            db.add(completion)
+            db.flush()
+            created_ids.append(completion.id)
+    yield
+    if created_ids:
+        with get_db() as db:
+            db.query(LessonCompletion).filter(LessonCompletion.id.in_(created_ids)).delete(synchronize_session=False)
 
 
 def test_video_metadata_mapping():
@@ -36,7 +65,7 @@ def test_video_metadata_mapping():
     assert "Install and Setup" in v2.title
 
 
-def test_module1_lesson1_watch_stage_playback_experience():
+def test_module1_lesson1_watch_stage_playback_experience(completed_demo_lesson):
     """Playwright browser verification of Watch stage for Module 1, Lesson 1."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -51,7 +80,7 @@ def test_module1_lesson1_watch_stage_playback_experience():
         page.wait_for_timeout(1000)
 
         # Step 1: Open Module 1, Lesson 1 directly at Watch stage
-        page.goto(f"{BASE_URL}/module/1/lesson/py-v2-u1-l01?stage=watch", wait_until="networkidle")
+        page.goto(f"{BASE_URL}/module/1/lesson/py-v2-u1-l01?resume=1&stage=watch", wait_until="networkidle")
         page.wait_for_timeout(1000)
 
         # Verify Watch tab is active

@@ -472,6 +472,11 @@ textarea.pip-editor-native {
   background-color: #4F83BC !important;
 }
 
+.lesson-tabs .q-tab.stage-locked {
+  color: #9B958D !important;
+  background: #F8F6F2 !important;
+}
+
 .lesson-panels {
   background: transparent !important;
   width: 100%;
@@ -524,6 +529,18 @@ textarea.pip-editor-native {
   border-color: #4F83BC;
   color: #396DAB;
   font-weight: 600;
+}
+
+.reading-pill.passed {
+  border-color: #8CB8A0;
+  color: #2D6A4F;
+}
+
+.reading-pill.locked,
+.challenge-tab-btn.locked {
+  color: #9B958D;
+  background: #F8F6F2;
+  border-style: dashed;
 }
 
 .lesson-prose {
@@ -1011,6 +1028,16 @@ textarea.pip-editor-native {
 }
 
 /* Accessibility: Respect User's Reduced Motion Preferences */
+.pip-desktop-nav {
+  display: none !important;
+}
+
+@media (min-width: 768px) {
+  .pip-desktop-nav {
+    display: flex !important;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

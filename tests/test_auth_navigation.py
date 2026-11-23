@@ -163,7 +163,7 @@ def test_deterministic_resume_resolution():
         assert l_id == "py-v2-u1-l01"
         assert stage == "read"
 
-        # 2. Learner paused mid-way in experiment stage (after finishing reading)
+        # 2. Navigation history in a locked future lesson cannot bypass Lesson 1.
         act = LessonActivity(
             learner_id=learner.id,
             module_id=1,
@@ -177,8 +177,21 @@ def test_deterministic_resume_resolution():
 
         m_id, l_id, stage = resolve_resume_target(db, learner.id)
         assert m_id == 1
+        assert l_id == "py-v2-u1-l01"
+        assert stage == "read"
+
+        # Once Lesson 1 is genuinely certified (represented by its durable
+        # completion row here), Lesson 2 is available, but forged stage and
+        # reading positions still do not count as completion evidence.
+        db.add(LessonCompletion(
+            learner_id=learner.id,
+            module_id=1,
+            lesson_id="py-v2-u1-l01",
+        ))
+        db.commit()
+        m_id, l_id, stage = resolve_resume_target(db, learner.id)
         assert l_id == "py-v2-u1-l02"
-        assert stage == "experiment"
+        assert stage == "read"
 
         # 3. Learner finishes m1-l2
         comp = LessonCompletion(
@@ -189,10 +202,13 @@ def test_deterministic_resume_resolution():
         db.add(comp)
         db.commit()
 
-        # Target advances to lesson 1 because it was never finished.
+        # Target advances to the next unfinished lesson in syllabus order.
         m_id, l_id, stage = resolve_resume_target(db, learner.id)
         assert m_id == 1
-        assert l_id == "py-v2-u1-l01"
+        assert l_id == "py-v2-u1-l03"
+
+        db.delete(user)
+        db.commit()
 
 
 def test_cross_account_isolation_and_progress_reset():

@@ -28,8 +28,9 @@ def render_header(active_route: str = "", compact: bool = False):
                 ui.label("Pip Learn").classes("font-serif text-xl tracking-tight leading-none text-[#161616]")
 
         # Middle Navigation Links: Curriculum · Study Space · About
-        with ui.row().classes("hidden md:flex items-center gap-6 sm:gap-8 font-sans text-sm text-[#2C2926]"):
+        with ui.row().classes("pip-desktop-nav items-center gap-6 sm:gap-8 font-sans text-sm text-[#2C2926]"):
             ui.button("Curriculum", on_click=nav.go_to_curriculum).props("flat dense").classes("text-[#2C2926] hover:text-[#161616] text-sm font-normal no-underline normal-case transition-colors")
+            ui.button("Rewards", on_click=nav.go_to_rewards).props("flat dense").classes("text-[#2C2926] hover:text-[#161616] text-sm font-normal no-underline normal-case transition-colors")
             if not is_authenticated:
                 ui.button("Study Space", on_click=nav.go_to_dashboard).props("flat dense").classes("text-[#2C2926] hover:text-[#161616] text-sm font-normal no-underline normal-case transition-colors")
             ui.button("About", on_click=lambda: ui.run_javascript('document.getElementById("about")?.scrollIntoView({behavior: "smooth"})')).props("flat dense").classes("text-[#2C2926] hover:text-[#161616] text-sm font-normal no-underline normal-case transition-colors")
@@ -40,6 +41,8 @@ def render_header(active_route: str = "", compact: bool = False):
                 with ui.menu().classes("bg-[#FBF8F3] border border-[#E2DCD2] font-sans p-2 rounded-xl shadow-md"):
                     with ui.menu_item(on_click=nav.go_to_curriculum):
                         ui.label("Curriculum").classes("text-sm text-[#161616]")
+                    with ui.menu_item(on_click=nav.go_to_rewards):
+                        ui.label("Rewards").classes("text-sm text-[#161616]")
                     with ui.menu_item(on_click=nav.go_to_dashboard):
                         ui.label("Study Space").classes("text-sm text-[#161616]")
                     with ui.menu_item(on_click=lambda: ui.run_javascript('document.getElementById("about")?.scrollIntoView({behavior: "smooth"})')):

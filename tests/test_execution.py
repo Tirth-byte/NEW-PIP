@@ -27,6 +27,25 @@ def test_security_violation_rejection():
     assert res["security_violation"] is True
     assert "Security restriction" in res["stderr"]
 
+
+def test_security_alias_dynamic_import_and_destructive_file_calls_rejected():
+    samples = [
+        "import os as alias; alias.system('echo bypass')",
+        "module = __import__('os'); module.system('echo bypass')",
+        "import os; os.remove('/tmp/not-owned-by-the-learner')",
+        "from socket import socket; socket()",
+    ]
+    for code in samples:
+        res = run_python_code(code)
+        assert res["success"] is False
+        assert res["security_violation"] is True
+
+
+def test_output_is_bounded():
+    res = run_python_code("while True: print('x' * 1000)")
+    assert res["success"] is False
+    assert len(res["stdout"].encode("utf-8")) <= 256_000
+
 def test_syntax_error_explanation():
     bad_code = "if True\n    print('Missing colon')"
     res = run_python_code(bad_code)

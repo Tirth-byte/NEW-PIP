@@ -196,7 +196,8 @@ def update_lesson_activity(db: Session, activity_id: int, **changes) -> LessonAc
         raise ValueError("Lesson activity not found")
     allowed = {
         "stage", "reading_section", "video_status", "notes", "experiment_code",
-        "experiment_attempted", "practice_state_json", "checkpoint_state_json",
+        "experiment_attempted", "experiment_passed", "reading_completed_json",
+        "practice_state_json", "checkpoint_state_json",
     }
     for key, value in changes.items():
         if key in allowed:
@@ -229,7 +230,13 @@ def update_learner_profile(
 
 
 def mark_lesson_complete(db: Session, learner_id: int, module_id: int, lesson_id: str, total_module_lessons: int) -> bool:
-    """Record lesson completion and update module progress percentage."""
+    """Record lesson completion only when every required activity is verified."""
+    from app.learning.progression import can_certify, get_lesson_progress
+
+    progress_snapshot = get_lesson_progress(db, learner_id, module_id, lesson_id)
+    if not progress_snapshot["certified"] and not can_certify(progress_snapshot):
+        return False
+
     existing = db.query(LessonCompletion).filter(
         LessonCompletion.learner_id == learner_id,
         LessonCompletion.module_id == module_id,
